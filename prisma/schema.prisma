@@ -1,0 +1,510 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── Identity & RBAC ─────────────────────────────
+
+enum StaffRole {
+  SUPER_ADMIN
+  REGIONAL_ADMIN
+  SUPPORT
+  FINANCE
+}
+
+model Staff {
+  id              String            @id @default(cuid())
+  name            String
+  email           String            @unique
+  passwordHash    String
+  role            StaffRole
+  isActive        Boolean           @default(true)
+  lastLoginAt     DateTime?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+  permissions     StaffPermission[]
+  regions         Station[]         @relation("StaffRegion")
+  createdOrders   Order[]           @relation("OrderCreatedBy")
+  orderStatusLogs OrderStatusLog[]
+}
+
+model StaffPermission {
+  id      String   @id @default(cuid())
+  staffId String
+  staff   Staff    @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  module  String
+  actions String[]
+
+  @@unique([staffId, module])
+}
+
+model Customer {
+  id          String    @id @default(cuid())
+  email       String    @unique
+  name        String?
+  lastLoginAt DateTime?
+  createdAt   DateTime  @default(now())
+  orders      Order[]
+}
+
+// Short-lived email OTP challenges for login/signup. One active row per email —
+// requesting a new code overwrites the previous one (codeHash, expiry, attempts reset).
+model EmailOtp {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  codeHash  String
+  attempts  Int      @default(0)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+// ── Rail / Station (Junction Management) ─────────────────────────────
+
+model Station {
+  id             String          @id @default(cuid())
+  code           String          @unique
+  name           String
+  state          String?
+  zone           String?
+  isActive       Boolean         @default(true)
+  outlets        Outlet[]
+  staff          Staff[]         @relation("StaffRegion")
+  orders         Order[]
+  vendorRequests VendorRequest[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isActive])
+}
+
+// ── Outlets & Menu ─────────────────────────────
+
+enum OutletStatus {
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  SUSPENDED
+}
+
+// Manual override the vendor sets on their own dashboard, independent of
+// working-hours/weekly-off — lets a vendor go "Busy" or "Closed" mid-shift
+// without an admin having to deactivate the whole outlet.
+enum OutletAvailability {
+  OPEN
+  BUSY
+  TEMPORARILY_CLOSED
+}
+
+model Outlet {
+  id             String  @id @default(cuid())
+  name           String
+  slug           String? @unique // public storefront URL — food-in-train-by-{name}-at-{station}. Nullable only because existing rows are backfilled by script; every create/update always sets it.
+  stationId      String
+  station        Station @relation(fields: [stationId], references: [id])
+  ownerName      String
+  phone          String
+  alternatePhone String?
+  email          String? @unique // also the vendor's own-panel login identifier
+  address        String?
+  description    String?
+  imageUrl       String?
+  imagePublicId  String?
+
+  fssaiLicenseNo  String
+  fssaiExpiryDate DateTime
+  gstNumber       String?
+
+  foodTypes         DietaryType[]
+  commissionPercent Decimal            @default(0) @db.Decimal(5, 2)
+  deliveryCharge    Decimal            @default(0) @db.Decimal(10, 2)
+  minOrderValue     Decimal            @default(0) @db.Decimal(10, 2)
+  minOrderTimeMins  Int                @default(30)
+  workingHoursStart String             @default("10:00")
+  workingHoursEnd   String             @default("22:00")
+  weeklyOff         String             @default("NONE") // "NONE" or a day name, e.g. "MONDAY"
+  availability      OutletAvailability @default(OPEN)
+
+  status   OutletStatus @default(PENDING_APPROVAL)
+  isActive Boolean      @default(false)
+
+  // Vendor's own login into their outlet panel (multi-tenant: one login per outlet).
+  // Null passwordHash = vendor login not yet provisioned.
+  passwordHash       String?
+  mustChangePassword Boolean   @default(true)
+  lastLoginAt        DateTime?
+
+  // Granted by Super Admin only — a vendor can create/edit their own menu items,
+  // or add platform-wide categories, only once the matching module is granted
+  // here. Same shape as StaffPermission, scoped to the outlet instead of a staff id.
+  permissions OutletPermission[]
+
+  documents OutletDocument[]
+  menuItems MenuItem[]
+  orders    Order[]
+
+  // Denormalized label of whoever created/last touched this outlet, e.g. "Surabhi Admin".
+  // Plain string rather than a Staff relation because admin auth is still a
+  // frontend-only session today (see Staff model note) — nothing to key a real FK on yet.
+  createdByLabel String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([stationId, status])
+}
+
+// Vendor-panel access grants — a row's presence means the vendor can act on
+// that module ("MENU" or "CATEGORY" today) from their own outlet panel.
+// Nothing here overrides the requirement that a vendor JWT can only ever
+// touch its own outletId; this only ever adds capability within that scope.
+model OutletPermission {
+  id       String   @id @default(cuid())
+  outletId String
+  outlet   Outlet   @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  module   String
+  actions  String[]
+
+  @@unique([outletId, module])
+}
+
+model OutletDocument {
+  id         String    @id @default(cuid())
+  outletId   String
+  outlet     Outlet    @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  docType    String
+  fileUrl    String
+  verifiedAt DateTime?
+  verifiedBy String?
+  createdAt  DateTime  @default(now())
+}
+
+// ── Catalog: Categories & Menu Items ─────────────────────────────
+
+enum DietaryType {
+  VEG
+  NON_VEG
+  JAIN
+  VEGAN
+}
+
+model Category {
+  id                String     @id @default(cuid())
+  name              String
+  slug              String     @unique
+  thumbnailUrl      String?
+  thumbnailPublicId String?
+  isActive          Boolean    @default(true)
+  displayOrder      Int        @default(0)
+  menuItems         MenuItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isActive, displayOrder])
+}
+
+model MenuItem {
+  id          String  @id @default(cuid())
+  name        String
+  description String?
+  imageUrl    String?
+
+  outletId   String
+  outlet     Outlet   @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  categoryId String
+  category   Category @relation(fields: [categoryId], references: [id])
+
+  price           Decimal     @db.Decimal(10, 2)
+  discountPercent Decimal     @default(0) @db.Decimal(5, 2) // 0-100, applied off `price` for display and cart totals
+  taxPercent      Decimal     @default(0) @db.Decimal(5, 2)
+  dietaryType     DietaryType
+  isAvailable     Boolean     @default(true)
+  prepTimeMins    Int?
+  displayOrder    Int         @default(0)
+
+  orderItems OrderItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([outletId, isAvailable])
+  @@index([categoryId])
+}
+
+// ── Coupons ─────────────────────────────
+
+enum DiscountType {
+  PERCENT
+  FIXED
+}
+
+model Coupon {
+  id               String       @id @default(cuid())
+  code             String       @unique
+  description      String?
+  discountType     DiscountType
+  discountValue    Decimal      @db.Decimal(10, 2)
+  minOrderValue    Decimal?     @db.Decimal(10, 2)
+  maxDiscountValue Decimal?     @db.Decimal(10, 2)
+  usageLimit       Int?
+  usedCount        Int          @default(0)
+  isActive         Boolean      @default(true)
+  validFrom        DateTime
+  validTo          DateTime
+  orders           Order[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isActive, validFrom, validTo])
+}
+
+// ── Orders ─────────────────────────────
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  PREPARING
+  OUT_FOR_DELIVERY
+  DELIVERED
+  CANCELLED
+  INCOMPLETE
+}
+
+enum PaymentMode {
+  COD
+  ONLINE
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+}
+
+enum OrderSource {
+  WEBSITE
+  CALL
+  ADMIN
+}
+
+model Order {
+  id          String @id @default(cuid())
+  orderNumber String @unique
+
+  // Customer / passenger details (captured even for guest checkout)
+  customerId    String?
+  customer      Customer? @relation(fields: [customerId], references: [id])
+  customerName  String
+  customerPhone String
+  customerEmail String?
+
+  // Journey details
+  pnr             String?
+  trainNumber     String?
+  trainName       String?
+  journeyDate     DateTime?
+  boardingStation String?
+  coach           String?
+  berth           String?
+
+  deliveryStationId String
+  deliveryStation   Station @relation(fields: [deliveryStationId], references: [id])
+  outletId          String
+  outlet            Outlet  @relation(fields: [outletId], references: [id])
+
+  items OrderItem[]
+
+  // Pricing snapshot — computed and frozen server-side at checkout
+  subtotal       Decimal @db.Decimal(10, 2)
+  discountAmount Decimal @default(0) @db.Decimal(10, 2)
+  deliveryCharge Decimal @default(0) @db.Decimal(10, 2)
+  gstAmount      Decimal @default(0) @db.Decimal(10, 2)
+  totalAmount    Decimal @db.Decimal(10, 2)
+
+  couponId String?
+  coupon   Coupon? @relation(fields: [couponId], references: [id])
+
+  paymentMode   PaymentMode
+  paymentStatus PaymentStatus @default(PENDING)
+  status        OrderStatus   @default(PENDING)
+
+  source           OrderSource @default(WEBSITE)
+  createdByStaffId String?
+  createdByStaff   Staff?      @relation("OrderCreatedBy", fields: [createdByStaffId], references: [id])
+
+  deliveryInstructions String?
+  cancellationReason   String?
+  internalNotes        String?
+
+  statusLogs OrderStatusLog[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, createdAt])
+  @@index([deliveryStationId])
+  @@index([outletId])
+  @@index([paymentStatus])
+  @@index([customerPhone])
+}
+
+model OrderItem {
+  id      String @id @default(cuid())
+  orderId String
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  menuItemId String?
+  menuItem   MenuItem? @relation(fields: [menuItemId], references: [id])
+
+  // Snapshot fields — historical orders must not change if the menu item is edited/removed later
+  nameSnapshot  String
+  priceSnapshot Decimal @db.Decimal(10, 2)
+  taxPercent    Decimal @default(0) @db.Decimal(5, 2)
+  quantity      Int
+  lineTotal     Decimal @db.Decimal(10, 2)
+  note          String?
+
+  @@index([orderId])
+}
+
+model OrderStatusLog {
+  id      String @id @default(cuid())
+  orderId String
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  fromStatus OrderStatus?
+  toStatus   OrderStatus
+
+  changedByStaffId String?
+  changedByStaff   Staff?  @relation(fields: [changedByStaffId], references: [id])
+  note             String?
+
+  createdAt DateTime @default(now())
+
+  @@index([orderId, createdAt])
+}
+
+// ── Contact Inquiries (public Contact Us form) ─────────────────────────────
+
+enum ContactInquiryStatus {
+  NEW
+  IN_PROGRESS
+  RESOLVED
+}
+
+model ContactInquiry {
+  id      String               @id @default(cuid())
+  name    String
+  email   String? // null for "Book on call" call-back requests, which only need a phone
+  phone   String?
+  subject String?
+  message String
+  status  ContactInquiryStatus @default(NEW)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, createdAt])
+}
+
+// ── Audit Trail (BRD 6.6 / 13.11) ─────────────────────────────
+
+enum AuditActorType {
+  STAFF
+  VENDOR
+  SYSTEM
+}
+
+// Denormalized, append-only log of sensitive admin/vendor actions (vendor
+// created, credentials reset, status changed, commission edited, etc).
+// Not FK'd to Staff/Outlet on purpose — a deleted actor or entity must not
+// break the trail, and this must never disappear when the record it
+// describes is later removed.
+model AuditLog {
+  id         String         @id @default(cuid())
+  actorType  AuditActorType
+  actorId    String?
+  actorLabel String
+  action     String
+  entityType String
+  entityId   String
+  metadata   Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([entityType, entityId, createdAt])
+  @@index([createdAt])
+}
+
+// ── Vendor Onboarding Requests (public "Partner with us" page) ─────────────────────────────
+
+enum VendorRequestStatus {
+  NEW
+  CONTACTED
+  APPROVED
+  REJECTED
+}
+
+// A restaurant asking to be listed. Deliberately separate from Outlet: an
+// applicant has no FSSAI expiry, commission or login yet, and a rejected
+// request must never leave a half-built outlet behind. Approving one is done
+// by creating a real Outlet from it in the admin panel, which links back here.
+model VendorRequest {
+  id              String        @id @default(cuid())
+  restaurantName  String
+  ownerName       String
+  phone           String
+  email           String
+  city            String
+  stationName     String // what the applicant typed/picked — the station may not be on the platform yet
+  stationId       String?
+  station         Station?      @relation(fields: [stationId], references: [id], onDelete: SetNull)
+  fssaiLicenseNo  String?
+  foodTypes       DietaryType[]
+  yearsInBusiness Int?
+  message         String?
+
+  status     VendorRequestStatus @default(NEW)
+  adminNotes String?
+  reviewedAt DateTime?
+  outletId   String? // set when an Outlet was created from this request
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, createdAt])
+  @@index([phone])
+}
+
+// ── Website Analytics (first-party, anonymous) ─────────────────────────────
+
+// One row per page view or tracked interaction on the public website. No IP,
+// name or email is stored — visitorId is a random id kept in the visitor's
+// own browser, sessionId rotates after 30 minutes of inactivity.
+model AnalyticsEvent {
+  id         String  @id @default(cuid())
+  type       String // "pageview" | "event"
+  name       String? // event name for type=event, e.g. "station_search", "add_to_cart"
+  pageViewId String? @unique // client-generated id for a pageview, so its time-on-page can be filled in on leave
+  path       String
+  referrer   String? // referring host only, never the full URL
+  visitorId  String
+  sessionId  String
+  device     String // "mobile" | "tablet" | "desktop"
+  browser    String?
+  utmSource  String?
+  durationMs Int?
+
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([type, createdAt])
+  @@index([sessionId])
+}

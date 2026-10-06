@@ -1,0 +1,75 @@
+import { Prisma } from '@prisma/client';
+
+// One shared shape for "an order with everything needed to render it" — used
+// by the customer confirmation view, the customer's order history, and the
+// admin order list/detail, so the frontend types don't drift across screens.
+export const orderDetailSelect = {
+  id: true,
+  orderNumber: true,
+  customerName: true,
+  customerPhone: true,
+  customerEmail: true,
+  pnr: true,
+  trainNumber: true,
+  trainName: true,
+  journeyDate: true,
+  boardingStation: true,
+  coach: true,
+  berth: true,
+  deliveryStation: { select: { id: true, name: true, code: true } },
+  outlet: { select: { id: true, name: true, slug: true, phone: true, imageUrl: true } },
+  items: {
+    select: {
+      id: true,
+      nameSnapshot: true,
+      priceSnapshot: true,
+      taxPercent: true,
+      quantity: true,
+      lineTotal: true,
+      note: true,
+    },
+  },
+  subtotal: true,
+  discountAmount: true,
+  deliveryCharge: true,
+  gstAmount: true,
+  totalAmount: true,
+  paymentMode: true,
+  paymentStatus: true,
+  status: true,
+  source: true,
+  deliveryInstructions: true,
+  cancellationReason: true,
+  statusLogs: {
+    select: { id: true, fromStatus: true, toStatus: true, note: true, createdAt: true },
+    orderBy: { createdAt: 'asc' },
+  },
+  createdAt: true,
+  updatedAt: true,
+} satisfies Prisma.OrderSelect;
+
+// Lighter shape for table/list views — no items or status history.
+export const orderListSelect = {
+  id: true,
+  orderNumber: true,
+  customerName: true,
+  customerPhone: true,
+  customerEmail: true,
+  pnr: true,
+  trainNumber: true,
+  journeyDate: true,
+  coach: true,
+  berth: true,
+  deliveryStation: { select: { id: true, name: true, code: true } },
+  outlet: { select: { id: true, name: true, phone: true } },
+  items: { select: { nameSnapshot: true, quantity: true } },
+  subtotal: true,
+  discountAmount: true,
+  deliveryCharge: true,
+  gstAmount: true,
+  totalAmount: true,
+  paymentMode: true,
+  paymentStatus: true,
+  status: true,
+  createdAt: true,
+} satisfies Prisma.OrderSelect;
